@@ -1,49 +1,116 @@
 import asyncio
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
-from aiogram.filters import Command
 import aiosqlite
 
 # 🔐 Sozlamalar
 BOT_TOKEN = "8337937134:AAGiG2N__ZfAB0WHish3mJV9AE8DqMAw9fs"
-CHANNEL_USERNAME = "@sizkimsiza"  # Kanal username
-ADMIN_IDS = [8133521082]  # Admin Telegram ID-lari
+CHANNEL_USERNAME = "@TerDU_Yoshlari"  # Kanal username
+ADMIN_IDS = [61040584]  # Admin Telegram ID-lari
 
 # 📦 Bot va Dispatcher
 bot = Bot(BOT_TOKEN)
 dp = Dispatcher()
 
+
 # 🔌 Ma'lumotlar bazasi yaratish
 async def init_db():
     async with aiosqlite.connect("data.db") as db:
+        # Tanlovlar jadvali
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS contests (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                is_active INTEGER DEFAULT 0
+            )
+        """)
+
+        # Videolar jadvali
         await db.execute("""
             CREATE TABLE IF NOT EXISTS videos (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                file_id TEXT,
-                caption TEXT
+                contest_id INTEGER NOT NULL,
+                file_id TEXT NOT NULL,
+                caption TEXT,
+                message_id INTEGER
             )
         """)
+
+        # Ovozlar jadvali
         await db.execute("""
             CREATE TABLE IF NOT EXISTS votes (
-                user_id INTEGER UNIQUE,
-                video_id INTEGER
+                user_id INTEGER,
+                video_id INTEGER NOT NULL,
+                contest_id INTEGER NOT NULL,
+                PRIMARY KEY (user_id, contest_id)
             )
         """)
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS users (
-                user_id INTEGER PRIMARY KEY
-            )
-        """)
+
+        # Agar aktiv tanlov bo‘lmasa, bittasini yaratamiz
+        cursor = await db.execute("SELECT id FROM contests WHERE is_active = 1")
+        row = await cursor.fetchone()
+        if not row:
+            await db.execute("INSERT INTO contests (is_active) VALUES (1)")
         await db.commit()
+
+
+# 📌 Joriy aktiv tanlovni olish
+async def get_active_contest_id():
+    async with aiosqlite.connect("data.db") as db:
+        cursor = await db.execute("SELECT id FROM contests WHERE is_active = 1")
+        row = await cursor.fetchone()
+        return row[0] if row else None
+
 
 # ✅ Obuna tekshirish
 async def check_subscription(user_id: int) -> bool:
     try:
         member = await bot.get_chat_member(CHANNEL_USERNAME, user_id)
-        return member.status in ['member', 'administrator', 'creator']
+        return member.status in ["member", "administrator", "creator"]
     except Exception as e:
         print(f"Subscription check failed: {e}")
         return False
+
+
+# 🎬 Videoni kanalga yuborish
+async def send_video_to_channel(video_id: int, file_id: str, caption: str, contest_id: int):
+    async with aiosqlite.connect("data.db") as db:
+        async with db.execute("SELECT COUNT(*) FROM votes WHERE video_id = ? AND contest_id = ?", (video_id, contest_id)) as cursor:
+            vote_count = (await cursor.fetchone())[0]
+
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[[
+            InlineKeyboardButton(
+                text=f"❤️ Ovoz berish ({vote_count})",
+                callback_data=f"vote_{video_id}"
+            )
+        ]]
+    )
+
+    msg = await bot.send_video(
+        chat_id=CHANNEL_USERNAME,
+        video=file_id,
+        caption=caption,
+        reply_markup=keyboard
+    )
+
+    async with aiosqlite.connect("data.db") as db:
+        await db.execute("UPDATE videos SET message_id=? WHERE id=?", (msg.message_id, video_id))
+        await db.commit()
+
+
+# 🏁 /start komandasi
+@dp.message(F.text == "/start")
+async def start_cmd(message: types.Message):
+    if message.from_user.id in ADMIN_IDS:
+        keyboard = InlineKeyboardMarkup(
+            inline_keyboard=[[
+                InlineKeyboardButton(text="🆕 Yangi tanlovni boshlash", callback_data="new_contest")
+            ]]
+        )
+        await message.answer("👋 Salom admin!\n\n📤 Kanal uchun video yuboring.", reply_markup=keyboard)
+    else:
+        await message.answer("❌ Siz admin emassiz.\nBu botdan faqat admin foydalana oladi.")
+
 
 # 🎥 Admin video yuklashi
 @dp.message(F.video)
@@ -52,171 +119,91 @@ async def upload_video(message: types.Message):
         await message.answer("❌ Siz admin emassiz, video qo'sha olmaysiz.")
         return
 
+    contest_id = await get_active_contest_id()
     file_id = message.video.file_id
     caption = message.caption or "Video"
 
     async with aiosqlite.connect("data.db") as db:
-        await db.execute("INSERT INTO videos (file_id, caption) VALUES (?, ?)", (file_id, caption))
+        cursor = await db.execute(
+            "INSERT INTO videos (contest_id, file_id, caption) VALUES (?, ?, ?)",
+            (contest_id, file_id, caption)
+        )
+        video_id = cursor.lastrowid
         await db.commit()
 
-    await message.answer("✅ Video qo‘shildi va barcha obunachilarga yuborilmoqda...")
+    await send_video_to_channel(video_id, file_id, caption, contest_id)
+    await message.answer("✅ Video kanalga joylandi!")
 
-    # 📢 Barcha foydalanuvchilarga yuborish
-    async with aiosqlite.connect("data.db") as db:
-        async with db.execute("SELECT user_id FROM users") as cursor:
-            users = await cursor.fetchall()
 
-    for (uid,) in users:
-        try:
-            await send_video_with_vote(uid, uid, message.message_id, file_id, caption)
-        except Exception as e:
-            print(f"Foydalanuvchiga yuborishda xatolik: {e}")
-
-# 🎬 Video ko‘rsatish (ovoz berish va o‘chirish tugmalari bilan)
-async def send_video_with_vote(chat_id: int, user_id: int, video_id: int, file_id: str, caption: str):
-    async with aiosqlite.connect("data.db") as db:
-        # Ovozlar sonini olish
-        async with db.execute("SELECT COUNT(*) FROM votes WHERE video_id = ?", (video_id,)) as cursor:
-            vote_count = (await cursor.fetchone())[0]
-
-        # Foydalanuvchi ovoz berganmi?
-        async with db.execute("SELECT * FROM votes WHERE user_id = ?", (user_id,)) as cursor:
-            has_voted = await cursor.fetchone()
-
-    # 🔑 Tugmalar
-    buttons = []
-    if not has_voted:
-        buttons.append([InlineKeyboardButton(text=f"❤️ Ovoz berish ({vote_count})", callback_data=f"vote_{video_id}")])
-    if user_id in ADMIN_IDS:
-        buttons.append([InlineKeyboardButton(text="🗑 Videoni o‘chirish", callback_data=f"delete_{video_id}")])
-
-    if buttons:
-        keyboard = InlineKeyboardMarkup(inline_keyboard=buttons)
-        await bot.send_video(chat_id, file_id, caption=caption, reply_markup=keyboard)
-    else:
-        await bot.send_video(chat_id, file_id, caption=f"{caption}\n\n📊 Ovozlar: {vote_count}")
-
-# 🎬 /start komandasi
-@dp.message(Command("start"))
-async def start_handler(message: types.Message):
-    subscribed = await check_subscription(message.from_user.id)
-    if not subscribed:
-        keyboard = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="🔗 Kanalga obuna bo‘lish", url=f"https://t.me/{CHANNEL_USERNAME.strip('@')}")],
-            [InlineKeyboardButton(text="✅ Obunani tekshirish", callback_data="check_sub")]
-        ])
-        await message.answer("🛑 Ovoz berishdan avval kanalga obuna bo‘ling:", reply_markup=keyboard)
+# 🆕 Yangi tanlovni boshlash
+@dp.callback_query(F.data == "new_contest")
+async def new_contest(call: types.CallbackQuery):
+    if call.from_user.id not in ADMIN_IDS:
+        await call.answer("❌ Faqat admin yangi tanlov boshlashi mumkin.", show_alert=True)
         return
 
-    # 🔖 Foydalanuvchini bazaga yozamiz
     async with aiosqlite.connect("data.db") as db:
-        await db.execute("INSERT OR IGNORE INTO users (user_id) VALUES (?)", (message.from_user.id,))
+        # Hamma eski tanlovlarni o‘chirib qo‘yamiz
+        await db.execute("UPDATE contests SET is_active = 0")
+        # Yangi tanlov yaratamiz
+        await db.execute("INSERT INTO contests (is_active) VALUES (1)")
         await db.commit()
 
-    async with aiosqlite.connect("data.db") as db:
-        async with db.execute("SELECT * FROM videos") as cursor:
-            rows = await cursor.fetchall()
+    await call.answer("🆕 Yangi tanlov boshlandi!", show_alert=True)
+    await call.message.edit_text("✅ Yangi tanlov boshlandi!\nEndi yangi videolarni yuklashingiz mumkin.")
 
-    if not rows:
-        await message.answer("Hozircha video mavjud emas.")
-        return
-
-    for video in rows:
-        video_id, file_id, caption = video
-        await send_video_with_vote(message.chat.id, message.from_user.id, video_id, file_id, caption)
-
-# 🔁 Obunani qayta tekshirish tugmasi
-@dp.callback_query(F.data == "check_sub")
-async def recheck_sub(call: types.CallbackQuery):
-    subscribed = await check_subscription(call.from_user.id)
-    if not subscribed:
-        await call.answer("❌ Hali obuna bo‘lmagansiz.", show_alert=True)
-    else:
-        # 🔖 Foydalanuvchini bazaga qo‘shamiz
-        async with aiosqlite.connect("data.db") as db:
-            await db.execute("INSERT OR IGNORE INTO users (user_id) VALUES (?)", (call.from_user.id,))
-            await db.commit()
-
-        await call.message.delete()
-        await call.message.answer("✅ Obuna tasdiqlandi.")
-
-        # Obuna bo‘lgach videolarni yuborish
-        async with aiosqlite.connect("data.db") as db:
-            async with db.execute("SELECT * FROM videos") as cursor:
-                rows = await cursor.fetchall()
-
-        for video in rows:
-            video_id, file_id, caption = video
-            await send_video_with_vote(call.message.chat.id, call.from_user.id, video_id, file_id, caption)
 
 # 🗳 Ovoz berish handleri
 @dp.callback_query(F.data.startswith("vote_"))
 async def vote_handler(call: types.CallbackQuery):
     video_id = int(call.data.split("_")[1])
     user_id = call.from_user.id
+    contest_id = await get_active_contest_id()
 
-    async with aiosqlite.connect("data.db") as db:
-        # Tekshirish
-        async with db.execute("SELECT * FROM votes WHERE user_id = ?", (user_id,)) as cursor:
-            if await cursor.fetchone():
-                await call.answer("❗️ Siz allaqachon ovoz bergansiz.", show_alert=True)
-                return
-
-        # Ovoz qo'shish
-        await db.execute("INSERT INTO votes (user_id, video_id) VALUES (?, ?)", (user_id, video_id))
-        await db.commit()
-
-        # Yangi ovozlar soni
-        async with db.execute("SELECT COUNT(*) FROM votes WHERE video_id = ?", (video_id,)) as count_cursor:
-            vote_count = (await count_cursor.fetchone())[0]
-
-        async with db.execute("SELECT file_id, caption FROM videos WHERE id = ?", (video_id,)) as video_cursor:
-            video_data = await video_cursor.fetchone()
-
-    # Inline tugmani olib tashlash
-    await call.message.edit_reply_markup(reply_markup=None)
-    await call.answer("✅ Ovoz berildi!")
-
-    # Captionni yangilash
-    new_caption = f"{video_data[1]}\n\n✅ Siz ovoz berdingiz!\n📊 Ovozlar: {vote_count}"
-    try:
-        await bot.edit_message_caption(
-            chat_id=call.message.chat.id,
-            message_id=call.message.message_id,
-            caption=new_caption,
-        )
-    except Exception as e:
-        print(f"Captionni yangilashda xatolik: {e}")
-
-    await call.message.answer("🗳 Ovoz uchun rahmat!")
-
-# 🗑 Videoni o‘chirish handleri
-@dp.callback_query(F.data.startswith("delete_"))
-async def delete_video(call: types.CallbackQuery):
-    user_id = call.from_user.id
-    if user_id not in ADMIN_IDS:
-        await call.answer("❌ Siz admin emassiz!", show_alert=True)
+    # Avval obuna tekshiramiz
+    if not await check_subscription(user_id):
+        await call.answer("🛑 Avval kanalga obuna bo‘ling!", show_alert=True)
         return
 
-    video_id = int(call.data.split("_")[1])
-
     async with aiosqlite.connect("data.db") as db:
-        await db.execute("DELETE FROM videos WHERE id = ?", (video_id,))
-        await db.execute("DELETE FROM votes WHERE video_id = ?", (video_id,))
+        # Shu foydalanuvchi shu tanlovda ovoz berganmi?
+        async with db.execute("SELECT video_id FROM votes WHERE user_id = ? AND contest_id = ?", (user_id, contest_id)) as cursor:
+            row = await cursor.fetchone()
+            if row:
+                await call.answer("❗ Siz allaqachon ovoz bergansiz!", show_alert=True)
+                return
+
+        # Yangi ovoz yozamiz
+        await db.execute("INSERT INTO votes (user_id, video_id, contest_id) VALUES (?, ?, ?)", (user_id, video_id, contest_id))
         await db.commit()
 
+        # Yangilangan ovozlar soni
+        async with db.execute("SELECT COUNT(*) FROM votes WHERE video_id = ? AND contest_id = ?", (video_id, contest_id)) as cursor:
+            vote_count = (await cursor.fetchone())[0]
+
+    # Tugmani yangilash
+    new_keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[[
+            InlineKeyboardButton(
+                text=f"❤️ Ovoz berish ({vote_count})",
+                callback_data=f"vote_{video_id}"
+            )
+        ]]
+    )
     try:
-        await call.message.delete()
+        await call.message.edit_reply_markup(reply_markup=new_keyboard)
     except Exception as e:
-        print(f"Xabarni o‘chirishda xatolik: {e}")
+        print(f"Tugma yangilash xatolik: {e}")
 
-    await call.answer("🗑 Video o‘chirildi!", show_alert=True)
+    await call.answer("✅ Ovoz berildi!")
 
-# 🏁 Botni ishga tushirish
+
+# 🚀 Botni ishga tushirish
 async def main():
     await init_db()
     print("Bot ishga tushmoqda...")
     await dp.start_polling(bot)
+
 
 if __name__ == "__main__":
     asyncio.run(main())
